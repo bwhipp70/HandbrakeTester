@@ -26,7 +26,10 @@
 //     Seems like Roku/Apple don't care, but the WebPlayer won't rewind (gets stuck) with MKV with any browser.
 //     So, for now, stick with MP4.
 
-// Test with changes (trying out GitHub).
+// Lossless
+// Needs to be:
+// --encoder-profile high444
+// --encoder-preset slower and veryslow produce identical images and file sizes.
 
 // Links
 // https://trac.ffmpeg.org/wiki/Encode/H.264
