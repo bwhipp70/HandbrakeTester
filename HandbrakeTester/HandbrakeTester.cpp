@@ -3,25 +3,9 @@
 // To Do:
 // 1.  Clean this crap up!
 //     Add ifdef debug for cout statements.
-// 2.  Integrate SSIM and PSNR from ffmpeg - determines how good of quality the rip is
-//     Same file = 1.0 (inf)
-//     Worst case I've seen = 0.842 (8.04 db) - lossless to Q=51/Ultrafast
-//     Works with both .mkv and .mp4
-//     Call it as a function and pass back the four numbers?
-//     Eventually just build it into versus external?
-// 3.  Make the settings of choice cleaner and easier to include
-//     Maybe ifdef?
-//     Use lengths to self generate (for x264 {a, b, c, d}, fix the containers to mkv (most common)
-// 4.  Change to a given length and position versus chapter
-//     Create the base file then use that for all rips - will speed up considerably!
-//     Example:  Solo - 6:15 to 6:45
-//		--start - at <string:number>
-//		Start encoding at a given duration(in seconds), frame, or pts(on a 90kHz clock) (e.g.duration:10, frame : 300, pts : 900000)
-//		--stop - at  <string:number>
-//		Stop encoding at a given duration(in seconds), frame, or pts(on a 90kHz clock) (e.g.duration:10, frame : 300, pts : 900000)
-// 5.  Translate the encoding strings from the batch file (organization and use of --)
-// 6.  Create a new output folder with T/D stamp for each run.
 // 7.  Check for ffmpeg and fail out if not there.
+// 8.  Integrate Boost libraries.
+// 9.  Put quotes around filenames to catch spaces.
 // A.  For the outside - decide to go .mkv for Plex?
 //     Seems like Roku/Apple don't care, but the WebPlayer won't rewind (gets stuck) with MKV with any browser.
 //     So, for now, stick with MP4.
@@ -67,447 +51,209 @@
 #include <array>
 #include <vector>
 #include <fstream>
-
+#include <boost/log/trivial.hpp>
+#include <boost/log/core.hpp>
+#include <boost/log/expressions.hpp>
+#include "boost/date_time/posix_time/posix_time.hpp"
+#include <sstream>
+#include <boost/filesystem/operations.hpp>
+#include <boost/filesystem/path.hpp>
+#include <boost/filesystem.hpp>
+#include <cstdlib>
+#include <cstdio>
 
 using namespace std;
+
+namespace logging = boost::log;
+
+void init_logging()
+{
+	// Logging Levels:
+	// trace, debug, info, warning, error, fatal
+	// https://blog.scalyr.com/2018/07/getting-started-quickly-c-logging/
+	
+	logging::core::get()->set_filter
+	(
+		logging::trivial::severity >= logging::trivial::debug
+	);
+}
+
+std::wstring FormatTime(boost::posix_time::ptime now)
+{
+	// Modified from:  https://stackoverflow.com/questions/5018188/how-to-format-a-datetime-to-string-using-boost
+	using namespace boost::posix_time;
+	static std::locale loc(std::wcout.getloc(),
+		new wtime_facet(L"%Y%m%d_%H%M%S"));
+
+	std::basic_stringstream<wchar_t> wss;
+	wss.imbue(loc);
+	wss << now;
+	return wss.str();
+}
+
 
 int main(int argc, char* argv[])
 {
 
 	// Set up base variables
 
-	std::string OutputDir = "D:\\Temp\\HBTester";
-	std::string HandbrakeDataFile = "D:\\Temp\\HandbrakeRun.csv";
+	std::string OutputDir = "D:\\Temp\\HBTester_";
+	std::string HandbrakeDataFile = "HandbrakeRun_";
 	std::string Chapter = "-c 37";  // For Solo - A Star Wars Story
 	std::string Subtitles = "--native-language eng --subtitle scan --subtitle-forced=1 --subtitle-default=1";
 	std::string Extension;
-	std::string HB_start = "\"\"C:\\Program Files\\Handbrake\\HandBrakeCLI.exe\"\" -i";
+	std::string HB_start = "\"\"C:\\Program Files\\Handbrake\\HandBrakeCLI.exe\"\"";
 	std::string HB_arg1 = "--verbose=1 --no-dvdnav --main-feature --angle 1 --previews 30:0";
 	std::string HB_arg2 = "--markers -O --ipod-atom --vfr -a 1,1 -E av_aac,copy:ac3 -6 dp12,auto -R Auto,Auto -B 160,0 -D 0,0 --gain 0,0 --audio-fallback ac3 --loose-anamorphic --modulus 2 --decomb";
 	std::string HB_total;
+	std::string HB_GeneralOptions = "--verbose=1 --no-dvdnav";
+	std::string HB_SourceOptions  = "--main-feature --angle 1 --previews 30:0";  // Requires Chapter or Duration Info
+	std::string HB_DestinationOptions = "--markers --optimize";  // Requires container Info
+	std::string HB_VideoOptions = "--vfr --encoder-level 4.0";  // Requires encoder and quality Info
+	std::string HB_AudioOptions = "--audio 1,1 --aencoder av_aac,copy:ac3 --audio-fallback ac3 --ab 160,0 --mixdown dpl2,auto --arate Auto,Auto --drc 0,0 --gain 0,0";
+	std::string HB_PictureOptions = "--loose-anamorphic --modulus 2";  // Requires maxwidth
+	std::string HB_FiltersOptions = "--decomb";
+	std::string HB_SubtitlesOptions = "--native-language eng --subtitle scan --subtitle-forced=1 --subtitle-default=1";
 	std::string OutputFile;
 	std::string OutputLog;
+
+	std::string HB_Lossless_Encode = "--encoder x264 --encoder-preset=veryslow  --encoder-profile=high444  --quality 0 --format mp4";
+	std::string Lossless_fn;
+//	std::string HB_Lossless_Chapter = "--start-at duration:375 --stop-at duration:30";
+	std::string HB_Lossless_Chapter = "--chapters 37";
+	// --chapters 1 --> Selects only Chapter 1
+	// --start - at duration : 375 --stop - at duration : 30
+	//		-> Start At is the number of seconds into the clip, Stop At is how long in seconds of the clip
+	//		-> So this is a 30 second clip starting at 6 minutes, 15 seconds into the feature
+
+	std::string ffmpeg_path = "D:\\Temp\\HBTester\\ffmpeg.exe";
+	std::string ssim_call;
+
+	int pos = 0;
+	std::string ssim_ratio;
+	std::string ssim_db;
+	std::string psnr_ratio;
 
 	// Still leaves input file, chapter, output file, container, encoder string, quality, subtitles, log file
 	   
 	// "C:\Program Files\Handbrake\HandBrakeCLI.exe" - i "%~1" --verbose = 1 --no - dvdnav --main - feature % Chapter% --angle 1 --previews 30:0 - o "%OutputDir%\%Name%.%DestExt%" - f % Container% --markers - O --ipod - atom % EncoderString% -q % Quality% --vfr - a 1, 1 - E av_aac, copy : ac3 - 6 dpl2, auto - R Auto, Auto - B 160, 0 - D 0, 0 --gain 0, 0 --audio - fallback ac3 --maxWidth %MaxWidth% --loose - anamorphic  --modulus 2 --decomb %Subtitles % 2 > "%OutputDir%\%Name%_log.txt"
 	
-	vector<string> codec;
-	vector<string> preset;
-	vector<string> profile;
-	vector<string> dest_ext;
-	vector<string> container;
+	// Codec Combination Vectors
+	// Format is:  CODEC, preset, profile, extension, container.
+	// See bottom of file for valid combinations.
 
-	// Encoder = x264
-	vector<string> codec_x264 = { "x264", "x264", "x264" };
-	vector<string> preset_x264 = { "veryslow", "slower", "slow" };
-	vector<string> profile_x264 = { "high", "high", "high" };
-	vector<string> dest_ext_x264 = { "mp4", "mp4", "mp4" };
-	vector<string> container_x264 = { "av_mp4", "av_mp4", "av_mp4" };
+	vector< vector<string>> codec_list;
+	codec_list.resize(120);  // Set arbitrarily high at first, will trim down later in code.
 
-	// Encoder = x264_10bit
-	vector<string> codec_x264_10bit = { "x264_10bit", "x264_10bit", "x264_10bit" };
-	vector<string> preset_x264_10bit = { "veryslow", "slower", "slow" };
-	vector<string> profile_x264_10bit = { "high10", "high10", "high10" };
-	vector<string> dest_ext_x264_10bit = { "mp4", "mp4", "mp4" };
-	vector<string> container_x264_10bit = { "av_mp4", "av_mp4", "av_mp4" };
+	// Place comments to skip sections.
+	// For empty fields, use "" as opposed to " ".
+	// Codecs 0-9 - x264
+	codec_list[0] = { "x264", "veryslow", "high", "mp4", "av_mp4" };
+	codec_list[1] = { "x264", "slower", "high", "mp4", "av_mp4" };
+	codec_list[2] = { "x264", "slow", "high", "mp4", "av_mp4" };
+	// Codecs 10-19 - x264_10bit
+	codec_list[10] = { "x264_10bit", "veryslow", "high10", "mp4", "av_mp4" };
+	codec_list[11] = { "x264_10bit", "slower", "high10", "mp4", "av_mp4" };
+	codec_list[12] = { "x264_10bit", "slow", "high10", "mp4", "av_mp4" };
+	// Codecs 20-29 - nvenc_h264
+	codec_list[20] = { "nvenc_h264", "slow", "high", "mp4", "av_mp4" };
+	codec_list[21] = { "nvenc_h264", "hq", "high", "mp4", "av_mp4" };
+	// Codecs 30-39 - x265
+	codec_list[30] = { "x265", "veryslow", "main", "mp4", "av_mp4" };
+	codec_list[31] = { "x265", "slower", "main", "mp4", "av_mp4" };
+	codec_list[32] = { "x265", "slow", "main", "mp4", "av_mp4" };
+	// Codecs 40-49 - x265_10bit
+	codec_list[40] = { "x265_10bit", "veryslow", "main10", "mp4", "av_mp4" };
+	codec_list[41] = { "x265_10bit", "slower", "main10", "mp4", "av_mp4" };
+	codec_list[42] = { "x265_10bit", "slow", "main10", "mp4", "av_mp4" };
+	// Codecs 50-59 - x265_12bit	
+	codec_list[50] = { "x265_12bit", "veryslow", "main12", "mp4", "av_mp4" };
+	codec_list[51] = { "x265_12bit", "slower", "main12", "mp4", "av_mp4" };
+	codec_list[52] = { "x265_12bit", "slow", "main12", "mp4", "av_mp4" };
+	// Codecs 60-69 - nvenc_h265
+	codec_list[60] = { "nvenc_h265", "slow", "main", "mp4", "av_mp4" };
+	codec_list[61] = { "nvenc_h265", "hq", "main", "mp4", "av_mp4" };
+	// Codecs 70-79 - VP8
+	codec_list[70] = { "VP8", "veryslow", "high", "mkv", "av_mkv" };
+	codec_list[71] = { "VP8", "slower", "high", "mkv", "av_mkv" };
+	codec_list[72] = { "VP8", "slow", "high", "mkv", "av_mkv" };
+	// Codecs 80-89 - VP9
+	codec_list[80] = { "VP9", "veryslow", "high", "mkv", "av_mkv" };
+	codec_list[81] = { "VP9", "slower", "high", "mkv", "av_mkv" };
+	codec_list[82] = { "VP9", "slow", "high", "mkv", "av_mkv" };
+	// Codecs 90-99 - theora
+	codec_list[90] = { "theora", "", "", "mkv", "av_mkv" };
+	// Codecs 100-109 - mpeg4
+	codec_list[100] = { "mpeg4", "", "", "mp4", "av_mp4" };
+	// Codecs 110-119 - mpeg2
+	codec_list[110] = { "mpeg2", "", "", "mp4", "av_mp4" };
 
-	// Encoder = nvenc_h264
-	vector<string> codec_nvenc_h264 = { "nvenc_h264", "nvenc_h264" };
-	vector<string> preset_nvenc_h264 = { "slow", "hq" };
-	vector<string> profile_nvenc_h264 = { "high", "high" };
-	vector<string> dest_ext_nvenc_h264 = { "mp4", "mp4" };
-	vector<string> container_nvenc_h264 = { "av_mp4", "av_mp4" };
-
-	// Encoder = x265
-	vector<string> codec_x265 = { "x265", "x265", "x265" };
-	vector<string> preset_x265 = { "veryslow", "slower", "slow" };
-	vector<string> profile_x265 = { "main", "main", "main" };
-	vector<string> dest_ext_x265 = { "mp4", "mp4", "mp4" };
-	vector<string> container_x265 = { "av_mp4", "av_mp4", "av_mp4" };
-
-	// Encoder = x265_10bit
-	vector<string> codec_x265_10bit = { "x265_10bit", "x265_10bit", "x265_10bit" };
-	vector<string> preset_x265_10bit = { "veryslow", "slower", "slow" };
-	vector<string> profile_x265_10bit = { "main10", "main10", "main10" };
-	vector<string> dest_ext_x265_10bit = { "mp4", "mp4", "mp4" };
-	vector<string> container_x265_10bit = { "av_mp4", "av_mp4", "av_mp4" };
-
-	// Encoder = x265_12bit
-	vector<string> codec_x265_12bit = { "x265_12bit", "x265_12bit", "x265_12bit" };
-	vector<string> preset_x265_12bit = { "veryslow", "slower", "slow" };
-	vector<string> profile_x265_12bit = { "main12", "main12", "main12" };
-	vector<string> dest_ext_x265_12bit = { "mp4", "mp4", "mp4" };
-	vector<string> container_x265_12bit = { "av_mp4", "av_mp4", "av_mp4" };
-
-	// Encoder = nvenc_h265
-	vector<string> codec_nvenc_h265 = { "nvenc_h265", "nvenc_h265" };
-	vector<string> preset_nvenc_h265 = { "slow", "hqslower" };
-	vector<string> profile_nvenc_h265 = { "main", "main" };
-	vector<string> dest_ext_nvenc_h265 = { "mp4", "mp4" };
-	vector<string> container_nvenc_h265 = { "av_mp4", "av_mp4" };
-
-	// Encoder = VP8
-	vector<string> codec_VP8 = { "VP8", "VP8", "VP8" };
-	vector<string> preset_VP8 = { "veryslow", "slower", "slow" };
-	vector<string> profile_VP8 = { "high", "high", "high" };
-	vector<string> dest_ext_VP8 = { "mkv", "mkv", "mkv" };
-	vector<string> container_VP8 = { "av_mkv", "av_mkv", "av_mkv" };
-
-	// Encoder = VP9
-	vector<string> codec_VP9 = { "VP9", "VP9", "VP9" };
-	vector<string> preset_VP9 = { "veryslow", "slower", "slow" };
-	vector<string> profile_VP9 = { "high", "high", "high" };
-	vector<string> dest_ext_VP9 = { "mkv", "mkv", "mkv" };
-	vector<string> container_VP9 = { "av_mkv", "av_mkv", "av_mkv" };
-
-	// Encoder = theora
-	vector<string> codec_theora = { "theora" };
-	vector<string> preset_theora = { "" };
-	vector<string> profile_theora = { "" };
-	vector<string> dest_ext_theora = { "mkv" };
-	vector<string> container_theora = { "av_mkv" };
-
-	// Encoder = mpeg4
-	vector<string> codec_mpeg4 = { "mpeg4" };
-	vector<string> preset_mpeg4 = { " " };
-	vector<string> profile_mpeg4 = { " " };
-	vector<string> dest_ext_mpeg4 = { "mp4" };
-	vector<string> container_mpeg4 = { "av_mp4" };
-
-	// Encoder = mpeg2
-	vector<string> codec_mpeg2 = { "mpeg2" };
-	vector<string> preset_mpeg2 = { " " };
-	vector<string> profile_mpeg2 = { " " };
-	vector<string> dest_ext_mpeg2 = { "mp4" };
-	vector<string> container_mpeg2 = { "av_mp4" };
+	BOOST_LOG_TRIVIAL(debug) << "Size of codec_list = " << codec_list.size();
 
 
-	codec.insert(
-		codec.end(),
-		std::make_move_iterator(codec_x264.begin()),
-		std::make_move_iterator(codec_x264.end())
-	);
-	codec.insert(
-		codec.end(),
-		std::make_move_iterator(codec_x264_10bit.begin()),
-		std::make_move_iterator(codec_x264_10bit.end())
-	);
-	codec.insert(
-		codec.end(),
-		std::make_move_iterator(codec_nvenc_h264.begin()),
-		std::make_move_iterator(codec_nvenc_h264.end())
-	);
-	codec.insert(
-		codec.end(),
-		std::make_move_iterator(codec_x265.begin()),
-		std::make_move_iterator(codec_x265.end())
-	);
-	codec.insert(
-		codec.end(),
-		std::make_move_iterator(codec_x265_10bit.begin()),
-		std::make_move_iterator(codec_x265_10bit.end())
-	);
-	codec.insert(
-		codec.end(),
-		std::make_move_iterator(codec_x265_12bit.begin()),
-		std::make_move_iterator(codec_x265_12bit.end())
-	);
-	codec.insert(
-		codec.end(),
-		std::make_move_iterator(codec_nvenc_h265.begin()),
-		std::make_move_iterator(codec_nvenc_h265.end())
-	);
-	codec.insert(
-		codec.end(),
-		std::make_move_iterator(codec_VP8.begin()),
-		std::make_move_iterator(codec_VP8.end())
-	);
-	codec.insert(
-		codec.end(),
-		std::make_move_iterator(codec_VP9.begin()),
-		std::make_move_iterator(codec_VP9.end())
-	);
-	codec.insert(
-		codec.end(),
-		std::make_move_iterator(codec_theora.begin()),
-		std::make_move_iterator(codec_theora.end())
-	);
-	codec.insert(
-		codec.end(),
-		std::make_move_iterator(codec_mpeg4.begin()),
-		std::make_move_iterator(codec_mpeg4.end())
-	);
-	codec.insert(
-		codec.end(),
-		std::make_move_iterator(codec_mpeg2.begin()),
-		std::make_move_iterator(codec_mpeg2.end())
-	);
+	// Shrink the two dimensional vector to minimum size.
+	// And remove empty entries.
 
+	int loop;
+	int sizeofvector;
 
-	preset.insert(
-		preset.end(),
-		std::make_move_iterator(preset_x264.begin()),
-		std::make_move_iterator(preset_x264.end())
-	);
-	preset.insert(
-		preset.end(),
-		std::make_move_iterator(preset_x264_10bit.begin()),
-		std::make_move_iterator(preset_x264_10bit.end())
-	);
-	preset.insert(
-		preset.end(),
-		std::make_move_iterator(preset_nvenc_h264.begin()),
-		std::make_move_iterator(preset_nvenc_h264.end())
-	);
-	preset.insert(
-		preset.end(),
-		std::make_move_iterator(preset_x265.begin()),
-		std::make_move_iterator(preset_x265.end())
-	);
-	preset.insert(
-		preset.end(),
-		std::make_move_iterator(preset_x265_10bit.begin()),
-		std::make_move_iterator(preset_x265_10bit.end())
-	);
-	preset.insert(
-		preset.end(),
-		std::make_move_iterator(preset_x265_12bit.begin()),
-		std::make_move_iterator(preset_x265_12bit.end())
-	);
-	preset.insert(
-		preset.end(),
-		std::make_move_iterator(preset_nvenc_h265.begin()),
-		std::make_move_iterator(preset_nvenc_h265.end())
-	);
-	preset.insert(
-		preset.end(),
-		std::make_move_iterator(preset_VP8.begin()),
-		std::make_move_iterator(preset_VP8.end())
-	);
-	preset.insert(
-		preset.end(),
-		std::make_move_iterator(preset_VP9.begin()),
-		std::make_move_iterator(preset_VP9.end())
-	);
-	preset.insert(
-		preset.end(),
-		std::make_move_iterator(preset_theora.begin()),
-		std::make_move_iterator(preset_theora.end())
-	);
-	preset.insert(
-		preset.end(),
-		std::make_move_iterator(preset_mpeg4.begin()),
-		std::make_move_iterator(preset_mpeg4.end())
-	);
-	preset.insert(
-		preset.end(),
-		std::make_move_iterator(preset_mpeg2.begin()),
-		std::make_move_iterator(preset_mpeg2.end())
-	);
+	sizeofvector = codec_list.size();
 
-	profile.insert(
-		profile.end(),
-		std::make_move_iterator(profile_x264.begin()),
-		std::make_move_iterator(profile_x264.end())
-	);
-	profile.insert(
-		profile.end(),
-		std::make_move_iterator(profile_x264_10bit.begin()),
-		std::make_move_iterator(profile_x264_10bit.end())
-	);
-	profile.insert(
-		profile.end(),
-		std::make_move_iterator(profile_nvenc_h264.begin()),
-		std::make_move_iterator(profile_nvenc_h264.end())
-	);
-	profile.insert(
-		profile.end(),
-		std::make_move_iterator(profile_x265.begin()),
-		std::make_move_iterator(profile_x265.end())
-	);
-	profile.insert(
-		profile.end(),
-		std::make_move_iterator(profile_x265_10bit.begin()),
-		std::make_move_iterator(profile_x265_10bit.end())
-	);
-	profile.insert(
-		profile.end(),
-		std::make_move_iterator(profile_x265_12bit.begin()),
-		std::make_move_iterator(profile_x265_12bit.end())
-	);
-	profile.insert(
-		profile.end(),
-		std::make_move_iterator(profile_nvenc_h265.begin()),
-		std::make_move_iterator(profile_nvenc_h265.end())
-	);
-	profile.insert(
-		profile.end(),
-		std::make_move_iterator(profile_VP8.begin()),
-		std::make_move_iterator(profile_VP8.end())
-	);
-	profile.insert(
-		profile.end(),
-		std::make_move_iterator(profile_VP9.begin()),
-		std::make_move_iterator(profile_VP9.end())
-	);
-	profile.insert(
-		profile.end(),
-		std::make_move_iterator(profile_theora.begin()),
-		std::make_move_iterator(profile_theora.end())
-	);
-	profile.insert(
-		profile.end(),
-		std::make_move_iterator(profile_mpeg4.begin()),
-		std::make_move_iterator(profile_mpeg4.end())
-	);
-	profile.insert(
-		profile.end(),
-		std::make_move_iterator(profile_mpeg2.begin()),
-		std::make_move_iterator(profile_mpeg2.end())
-	);
+	BOOST_LOG_TRIVIAL(debug) << "Shrinking the two dimensional vector.";
 
-	dest_ext.insert(
-		dest_ext.end(),
-		std::make_move_iterator(dest_ext_x264.begin()),
-		std::make_move_iterator(dest_ext_x264.end())
-	);
-	dest_ext.insert(
-		dest_ext.end(),
-		std::make_move_iterator(dest_ext_x264_10bit.begin()),
-		std::make_move_iterator(dest_ext_x264_10bit.end())
-	);
-	dest_ext.insert(
-		dest_ext.end(),
-		std::make_move_iterator(dest_ext_nvenc_h264.begin()),
-		std::make_move_iterator(dest_ext_nvenc_h264.end())
-	);
-	dest_ext.insert(
-		dest_ext.end(),
-		std::make_move_iterator(dest_ext_x265.begin()),
-		std::make_move_iterator(dest_ext_x265.end())
-	);
-	dest_ext.insert(
-		dest_ext.end(),
-		std::make_move_iterator(dest_ext_x265_10bit.begin()),
-		std::make_move_iterator(dest_ext_x265_10bit.end())
-	);
-	dest_ext.insert(
-		dest_ext.end(),
-		std::make_move_iterator(dest_ext_x265_12bit.begin()),
-		std::make_move_iterator(dest_ext_x265_12bit.end())
-	);
-	dest_ext.insert(
-		dest_ext.end(),
-		std::make_move_iterator(dest_ext_nvenc_h265.begin()),
-		std::make_move_iterator(dest_ext_nvenc_h265.end())
-	);
-	dest_ext.insert(
-		dest_ext.end(),
-		std::make_move_iterator(dest_ext_VP8.begin()),
-		std::make_move_iterator(dest_ext_VP8.end())
-	);
-	dest_ext.insert(
-		dest_ext.end(),
-		std::make_move_iterator(dest_ext_VP9.begin()),
-		std::make_move_iterator(dest_ext_VP9.end())
-	);
-	dest_ext.insert(
-		dest_ext.end(),
-		std::make_move_iterator(dest_ext_theora.begin()),
-		std::make_move_iterator(dest_ext_theora.end())
-	);
-	dest_ext.insert(
-		dest_ext.end(),
-		std::make_move_iterator(dest_ext_mpeg4.begin()),
-		std::make_move_iterator(dest_ext_mpeg4.end())
-	);
-	dest_ext.insert(
-		dest_ext.end(),
-		std::make_move_iterator(dest_ext_mpeg2.begin()),
-		std::make_move_iterator(dest_ext_mpeg2.end())
-	);
+	for (loop = 0; loop <= sizeofvector - 1; loop = loop + 1) {
+	//	BOOST_LOG_TRIVIAL(debug) << "codec_list entry #" << loop << " size is: " << codec_list[loop].size();
+	//	BOOST_LOG_TRIVIAL(debug) << "codec_list entry #" << loop << " empty is: " << codec_list[loop].empty();
+		if (codec_list[loop].empty())
+		{
+	//		BOOST_LOG_TRIVIAL(debug) << "Removing codec_list entry #" << loop;
+			codec_list.erase(codec_list.begin() + loop);
+			if (loop < static_cast<int>(codec_list.size()) )
+			{
+				loop = loop - 1;
+			//	BOOST_LOG_TRIVIAL(debug) << "Decrementing Loop.";
+			}
+			else
+			{
+				loop = sizeofvector;
+			//	BOOST_LOG_TRIVIAL(debug) << "Got to the end, exiting.";
+			}
+		}
 
-	container.insert(
-		container.end(),
-		std::make_move_iterator(container_x264.begin()),
-		std::make_move_iterator(container_x264.end())
-	);
-	container.insert(
-		container.end(),
-		std::make_move_iterator(container_x264_10bit.begin()),
-		std::make_move_iterator(container_x264_10bit.end())
-	);
-	container.insert(
-		container.end(),
-		std::make_move_iterator(container_nvenc_h264.begin()),
-		std::make_move_iterator(container_nvenc_h264.end())
-	);
-	container.insert(
-		container.end(),
-		std::make_move_iterator(container_x265.begin()),
-		std::make_move_iterator(container_x265.end())
-	);
-	container.insert(
-		container.end(),
-		std::make_move_iterator(container_x265_10bit.begin()),
-		std::make_move_iterator(container_x265_10bit.end())
-	);
-	container.insert(
-		container.end(),
-		std::make_move_iterator(container_x265_12bit.begin()),
-		std::make_move_iterator(container_x265_12bit.end())
-	);
-	container.insert(
-		container.end(),
-		std::make_move_iterator(container_nvenc_h265.begin()),
-		std::make_move_iterator(container_nvenc_h265.end())
-	);
-	container.insert(
-		container.end(),
-		std::make_move_iterator(container_VP8.begin()),
-		std::make_move_iterator(container_VP8.end())
-	);
-	container.insert(
-		container.end(),
-		std::make_move_iterator(container_VP9.begin()),
-		std::make_move_iterator(container_VP9.end())
-	);
-	container.insert(
-		container.end(),
-		std::make_move_iterator(container_theora.begin()),
-		std::make_move_iterator(container_theora.end())
-	);
-	container.insert(
-		container.end(),
-		std::make_move_iterator(container_mpeg4.begin()),
-		std::make_move_iterator(container_mpeg4.end())
-	);
-	container.insert(
-		container.end(),
-		std::make_move_iterator(container_mpeg2.begin()),
-		std::make_move_iterator(container_mpeg2.end())
-	);
+	}
 
+	sizeofvector = codec_list.size();
+	BOOST_LOG_TRIVIAL(debug) << "Compressed codec_list from 120 to " << sizeofvector;
 
+	for (loop = 0; loop <= sizeofvector - 1; loop = loop + 1) {
+	//	BOOST_LOG_TRIVIAL(debug) << "codec_list entry #" << loop << " is: " << codec_list[loop][0];
+	}
 
 	int MaxWidth;
-	int Quality;
-	int QStart = 18;
-	int QEnd = 24;
+	int QStart = 16;  // Start of Quality range; 0 is lossless/placebo; 51 is the worst. 
+	int QEnd = 24;    // End of Quality range; 0 is lossless/placebo; 51 is the worst.
 	int loop_enc = 0;
 	int loop_q = 0;
 	int max_enc = 0;
 
-	cout << "OutputDir = " << OutputDir << ".\n";
-	cout << "Length = " << argc << "\n";
+	BOOST_LOG_TRIVIAL(debug) << "OutputDir = " << OutputDir;
+//	BOOST_LOG_TRIVIAL(debug) << "Length = " << argc;
 
+//  Get the current time to name the working directory.  Using local timezone.
+	boost::posix_time::ptime now = boost::posix_time::second_clock::local_time();
 
-//	std::experimental::filesystem::path p(HandbrakeDataFile);
-//	std::cout << "filename and extension: " << p.filename() << std::endl; // "file.ext"
-//	std::cout << "filename only: " << p.stem() << std::endl;              // "file"
+	std::wstring ws(FormatTime(now));
+	BOOST_LOG_TRIVIAL(debug) << "Date_Time = " << ws;
 
-//	std::string filename = p.stem().string();
+	const std::string date_time(ws.begin(), ws.end());
+
+	OutputDir = OutputDir + date_time;
+	BOOST_LOG_TRIVIAL(debug) << "New Output Directory = " << OutputDir;
+
+	boost::filesystem::path data_dir(OutputDir);
+	BOOST_LOG_TRIVIAL(debug) << "Directory Exists? " << boost::filesystem::exists(data_dir);
+
+	boost::filesystem::create_directory(data_dir);
 
 	// Check to see if a file was dragged and then set the MaxWidth based on the extension.
 
@@ -515,44 +261,30 @@ int main(int argc, char* argv[])
 	std::string fn;
 	std::string filename;
 	std::string fullfilename;
-
-
-	cout << "argc =" << argc << "\n";
+	
+	BOOST_LOG_TRIVIAL(debug) << "Number of files dropped (2 = 1 file, etc.) (argc) = " << argc;
 
 	if (argc > 1)
 	{
 		fullfilename = argv[1];
 		std::experimental::filesystem::path p(argv[1]);
-		cout << "Source File! \n"; 
+		BOOST_LOG_TRIVIAL(debug) << "Source File!";
 		fn = p.stem().string();
 		filename = p.filename().string();
-		std::cout << "filename only: " << fn << std::endl;
-		std::cout << "filename only: " << p.stem() << std::endl;
 	} else {
 		fullfilename = OutputDir + "\\bad.txt";
-		cout << "No Source File! \n"; 
+		BOOST_LOG_TRIVIAL(debug) << "No Source File!";
 		fn = "NoSourceFile";
 		filename = "NoSourceFile.iso";
-//		std::experimental::filesystem::path p("C:\\NoSourceFile.iso");
-//		cout << "No Source File \n";
-//		std::string fn = p.stem().string();
-//		std::cout << "filename only: " << fn << std::endl; 
-//		std::cout << "filename only: " << p.stem() << std::endl;
 	}
 
-//	std::string fn = p.stem().string();
-	cout << "Full Filename = " << filename << "\n";
-	cout << "Filename No Ext = " << fn << "\n";
-
-//	std::experimental::filesystem::path p(fn);
-
-//	std::string filename = p.stem().string();
+	BOOST_LOG_TRIVIAL(debug) << "Full Filename = " << filename;
+	BOOST_LOG_TRIVIAL(debug) << "Filename No Ext = " << fn;
 
 	std::string f_ext = filename.substr(filename.find_last_of(".") + 1);
 
-	cout << "Extension Portion = " << f_ext << "\n";
+	BOOST_LOG_TRIVIAL(debug) << "Extension Portion = " << f_ext;
 
-//	if (fn.substr(fn.find_last_of(".") + 1) == "iso")
 	if (f_ext == "iso")
 	{
 		MaxWidth = 1280;
@@ -561,154 +293,319 @@ int main(int argc, char* argv[])
 		MaxWidth = 1920;
 	}
 
-//	if (argc > 1)
-//	{
-//		cout << "Sample File = " << argv[1] << "\n";
-//		std::experimental::filesystem::path p(argv[1]);
-//		
-//		std::string fn = argv[1];
-//		if (fn.substr(fn.find_last_of(".") + 1) == "iso") {
-//			MaxWidth = 1280;
-//		}
-//		else {
-//			MaxWidth = 1920;
-//		}
-//	}
-//	else {
-//		std::experimental::filesystem::path p("C:\\NoFileInput.none");
-//		std::string filename = "NoFileInput";
-//		std::string filename = p.stem().string();
-//		cout << "No File Input \n";
-//		cout << "Filename = " << filename << "\n";
-//		MaxWidth = 0;
-//	}
-
-	cout << "Filename = " << fn << "\n";
-	cout << "MaxWidth = " << MaxWidth << "\n";
+	BOOST_LOG_TRIVIAL(debug) << "MaxWidth = " << MaxWidth;
 	
-	max_enc = codec.size();
-	cout << "Size of Array = " << max_enc << "\n";
-	
-	cout << "0 - " << codec[0] << "\n";
-	cout << "1 - " << codec[1] << "\n";
-	cout << "2 - " << codec[2] << "\n";
-	cout << "3 - " << codec[3] << "\n";
-	cout << "4 - " << codec[4] << "\n";
+	Lossless_fn = OutputDir + "\\" + fn + "_lossless.mp4";
 
-	system("pause");
+	HB_total = HB_start + " " +
+		HB_GeneralOptions + " " +
+		HB_SourceOptions + " " + HB_Lossless_Chapter + " " +
+		HB_DestinationOptions + " " +
+		HB_VideoOptions + " " + HB_Lossless_Encode + " " +
+		HB_AudioOptions + " " +
+		HB_PictureOptions + " --maxWidth " + std::to_string(MaxWidth) + " " +
+		HB_FiltersOptions + " " +
+		HB_SubtitlesOptions + " " +
+		"-i " + fullfilename + " " +
+		"-o " + Lossless_fn + " " +
+		"2> " + OutputDir + "\\" + fn + "_lossless.log";
+
+//	BOOST_LOG_TRIVIAL(debug) << "The HB command is: " << HB_total;
+
+	if (argc > 1) {
+		// Call with System
+		system(HB_total.c_str());
+	}
+	else {
+		// Just echo to the screen
+		BOOST_LOG_TRIVIAL(debug) << "No file to use.";
+	}
+
+	max_enc = codec_list.size();
+
+//	system("pause");
+
+	int counter = 0;
+	int totalcount = max_enc * (QEnd - QStart + 1);  // Will always loop through once.
+	std::array<char, 256> buffer;
+	std::string result;
 
 // Open the output file
+	HandbrakeDataFile = OutputDir + "\\" + HandbrakeDataFile + date_time + ".csv";
+	BOOST_LOG_TRIVIAL(debug) << "Opening the CSV output file:  " << HandbrakeDataFile << std::endl;
+
 	std::ofstream csvfile;
 	csvfile.open(HandbrakeDataFile);
 	csvfile << "Handbrake Video Settings Comparison Tool\n";
 	csvfile << "\n";
-	csvfile << "Source File: " << fullfilename << "\n";
-	csvfile << "Run#,CODEC,Preset,Profile,DestExt,Container,Quality,Total Seconds,File Size,DateTime\n";
+	csvfile << "Source File: " << fullfilename << std::endl;
+	csvfile << "Run#,CODEC,Preset,Profile,DestExt,Container,Quality,SSIM(dB),SSIM,PSNR,Total Seconds,File Size,DateTime\n";
 
 	cout << "Handbrake Video Settings Comparison Tool\n";
-	cout << "\n";
-	cout << "Source File: " << fullfilename << "\n";
-	cout << "Run#,CODEC,Preset,Profile,DestExt,Container,Quality,Total Seconds,File Size,DateTime\n";
-
-
-	int counter = 0;
+	cout << std::endl;
+	cout << "Source File: " << fullfilename << std::endl;
+	cout << "Destination Directory:  " << OutputDir << std::endl;
+	cout << "FFmpeg.exe Path:  " << ffmpeg_path << std::endl;
+	cout << "CSV Data File:  " << HandbrakeDataFile << std::endl;
+	
+	cout << "Quality Range:  From - " << QStart << " to " << QEnd << std::endl;
+	cout << "Number of different encoder selections:  " << max_enc << std::endl;
+	cout << "Total number of iterations:  " << totalcount << std::endl;
+	cout << std::endl;
+	cout << "Run#,CODEC,Preset,Profile,DestExt,Container,Quality,SSIM(dB),SSIM,PSNR,Total Seconds,File Size,DateTime\n";
 
 	for (loop_enc = 0; loop_enc < max_enc; loop_enc = loop_enc + 1) {
-//	for (loop_enc = 0; loop_enc < 1; loop_enc = loop_enc + 1) {
 
 	// Start to loop through the Quality settings
 
 		for (loop_q = QStart; loop_q <= QEnd; loop_q = loop_q + 1) {
 			
+		//  Keep track of how many loops and as an index in the CSV file.
 			counter = counter + 1;
 
-			// current date/time based on current system
+		//  Grab current Date/Time for reference in the CSV file.
+
+		//  current date/time based on current system
 			time_t now = time(0);
 
-			// convert now to string form
-//			char* dt = ctime_s(&now);
+		//  convert now to string form
+		//	char* dt = ctime_s(&now);
 			char dt[26];
 			errno_t err = ctime_s(dt, 26, &now);
 
-			cout << "The local date and time is: " << dt << endl;
+		//  BOOST_LOG_TRIVIAL(debug) << "The local date and time is: " << dt << endl;
 
 			time_t curr_time;
-			tm * curr_tm;
 			struct tm timeinfo;
 			char dt_string[100];
 			time(&curr_time);
 			localtime_s(&timeinfo, &curr_time);
-//			curr_tm = localtime(&curr_time);
 
-//			strftime(dt_string, 50, "%Y%m%d_%H%M", curr_tm);
 			strftime(dt_string, 50, "%Y%m%d_%H%M", &timeinfo);
-			cout << "Date and Time for File = " << dt_string << "\n";
+			BOOST_LOG_TRIVIAL(debug) << "Date and Time for File = " << dt_string;
 
-			OutputFile = OutputDir + "\\" + fn + "_" + codec[loop_enc] + "_" + "q" + std::to_string(loop_q) + "_" + std::to_string(MaxWidth) + "_" + dt_string + "." + dest_ext[loop_enc];
-			cout << "Output File: " << OutputFile + "\n";
+			OutputFile = OutputDir + "\\" + fn + "_" + codec_list[loop_enc][0] + "_" + "q" + std::to_string(loop_q) + "_" +
+				codec_list[loop_enc][1] +"_" + codec_list[loop_enc][2] + 
+				"." + codec_list[loop_enc][3];
+			BOOST_LOG_TRIVIAL(debug) << "Output File: " << OutputFile;
 
-			OutputLog = OutputDir + "\\" + fn + "_" + codec[loop_enc] + "_" + "q" + std::to_string(loop_q) + "_" + std::to_string(MaxWidth) + "_" + dt_string + "_log.txt";
-			cout << "Output File: " << OutputLog + "\n";
+			OutputLog = OutputDir + "\\" + fn + "_" + codec_list[loop_enc][0] + "_" + "q" + std::to_string(loop_q) + "_" +
+				codec_list[loop_enc][1] + "_" + codec_list[loop_enc][2] +
+				"_log.txt";
+			BOOST_LOG_TRIVIAL(debug) << "Output Log File: " << OutputLog;
 
-			HB_total = HB_start + " " + fullfilename + " " + HB_arg1 + " " + Chapter + " -o " + OutputFile +
-				" -e " + codec[loop_enc] +
-				" --encoder-preset " + preset[loop_enc] +
-				" --encoder-profile " + profile[loop_enc] +
-				" --encoder-level 4.0 " +
-				Subtitles + " " + HB_arg2 + " " +
-				" -f " + container[loop_enc] +
-				" -q " + std::to_string(loop_q) +
-				" 2> " + OutputLog;
+			HB_total = HB_start + " " +
+				HB_GeneralOptions + " " +
+				HB_SourceOptions + " " + 
+				HB_DestinationOptions + " " + 
+				"--format " + codec_list[loop_enc][4] + " " +
+				HB_VideoOptions + " " + 
+				"--encoder " + codec_list[loop_enc][0] + " " +
+				"--encoder-preset " + codec_list[loop_enc][1] + " " +
+				"--encoder-profile " + codec_list[loop_enc][2] + " " +
+				"--quality " + std::to_string(loop_q) + " " +
+				HB_AudioOptions + " " +
+				HB_PictureOptions + " --maxWidth " + std::to_string(MaxWidth) + " " +
+				HB_FiltersOptions + " " +
+				HB_SubtitlesOptions + " " +
+				"-i " + Lossless_fn + " " +
+				"-o " + OutputFile + " " +
+				"2> " + OutputLog;
+
+			BOOST_LOG_TRIVIAL(debug) << "Loop Encoder = " << loop_enc;
+			BOOST_LOG_TRIVIAL(debug) << "Loop Quality = " << loop_q;
+			BOOST_LOG_TRIVIAL(debug) << "HB command = " << HB_total;
 			
+			// Start to time the Handbrake Encode
 			auto start = std::chrono::system_clock::now();
-
-			cout << "Loop Encoder = " << loop_enc << "\n";
-			cout << "Loop Quality = " << loop_q << "\n";
-			cout << "HB command = " << HB_total << "\n";
 
 			if (argc > 1) {
 				// Call with System
 				system(HB_total.c_str());
-//				cout << "File was dragged and dropped.\n";
 			}
 			else {
 				// Just echo to the screen
-				cout << "No file to use.\n";
+				BOOST_LOG_TRIVIAL(debug) << "No file to use.";
 			}
-					   
-//			system("dir D:\\Temp");
-
+			
+			// Stop the timer, encode is finished.
 			auto end = std::chrono::system_clock::now();
 
 			std::chrono::duration<double> elapsed_seconds = end - start;
 			std::time_t end_time = std::chrono::system_clock::to_time_t(end);
 
-//			std::cout << "finished computation at " << std::time_t(&end_time)
-//				<< "elapsed time: " << elapsed_seconds.count() << "s\n";
-			std::cout << "Elapsed time: " << elapsed_seconds.count() << "s\n";
+			BOOST_LOG_TRIVIAL(debug) << "Elapsed time: " << elapsed_seconds.count() << "s";
 
-			long end_file;
-			ifstream resultfile(OutputFile);
-			resultfile.seekg(0, ios::end);
-			end_file = resultfile.tellg();
-			resultfile.close();
-			cout << "size is: " << end_file << " bytes.\n";
+			// Now run SSIM against it to get video compression quality metrics
 
-//			csvfile << "Run#,CODEC,Preset,Profile,DestExt,Container,Quality,Total Seconds,File Size,DateTime\n";
-			csvfile << counter << "," << codec[loop_enc] << "," << preset[loop_enc] << "," << profile[loop_enc] << "," << dest_ext[loop_enc]
-				<< "," << container[loop_enc] << "," << loop_q << "," << elapsed_seconds.count() << "," << end_file << "," << dt_string << "\n";
-			cout << counter << "," << codec[loop_enc] << "," << preset[loop_enc] << "," << profile[loop_enc] << "," << dest_ext[loop_enc]
-				<< "," << container[loop_enc] << "," << loop_q << "," << elapsed_seconds.count() << "," << end_file << "," << dt_string << "\n";
+			// Output for using two differently compressed files:
+			//[Parsed_ssim_0 @ 0000021d52b99c00] SSIM Y:0.999472 (32.777502) U:0.999448 (32.579794) V:0.999451 (32.603229) All:0.999465 (32.714842)
+			//[Parsed_psnr_1 @ 0000021d51a1a200] PSNR y:62.310421 u:62.821236 v:62.802943 average:62.471287 min:59.999097 max:65.930472
 
+			// Output for identical files to show that they are identical:
+			//[Parsed_ssim_0 @ 0000026c324fef00] SSIM Y:1.000000 (inf) U:1.000000 (inf) V:1.000000 (inf) All:1.000000 (inf)
+			//[Parsed_psnr_1 @ 0000026c32579600] PSNR y:inf u:inf v:inf average:inf min:inf max:inf
+
+			// https://www.jeremymorgan.com/tutorials/c-programming/how-to-capture-the-output-of-a-linux-command-in-c/
+
+			ssim_call = ffmpeg_path + " " +
+				"-i " + OutputFile + " " +  // This is the file you are comparing
+				"-i " + Lossless_fn + " " +  // This is the reference/lossless file
+				"-lavfi \"ssim; [0:v][1:v]psnr\" -f null /dev/null 2>&1 | findstr /c:\"All:\" /c:\"average:\"";
+
+//			BOOST_LOG_TRIVIAL(debug) << "The ssim_call = " << ssim_call;
+
+			result = "";
+
+			if (argc > 1) {
+				// Call with System
+				FILE* pipe = _popen(ssim_call.c_str(), "r");
+				if (!pipe)
+				{
+					BOOST_LOG_TRIVIAL(debug) << "Couldn't start the ssim command.";
+					return 0;
+				}
+				while (fgets(buffer.data(), 256, pipe) != NULL) {
+					BOOST_LOG_TRIVIAL(debug) << "Reading...";
+					result += buffer.data();
+				}
+				auto returnCode = _pclose(pipe);
+				BOOST_LOG_TRIVIAL(debug) << "Result =" << result;
+				BOOST_LOG_TRIVIAL(debug) << "returnCode = " << returnCode;
+			}
+			else {
+				// Just echo to the screen
+				BOOST_LOG_TRIVIAL(debug) << "No file to use.";
+			}
+
+			// Pull out the SSIM in dB and absolute value (values after "All:")
+			// Pull out the average PSNR
+			
+			auto end_file = "0";
+			
+			if (argc > 1) {
+				pos = 0;
+				pos = result.find("All:");
+				ssim_ratio = result.substr(pos + 4, result.npos); // Grab to end of the string
+				pos = ssim_ratio.find("(");
+				ssim_db = ssim_ratio.substr(pos + 1, ssim_db.npos);
+				pos = ssim_db.find(")");
+				ssim_db = ssim_db.substr(0, pos + 1);
+				ssim_db = ssim_db.substr(0, ssim_db.size() - 1);
+				ssim_ratio = ssim_ratio.substr(0, 8);
+				BOOST_LOG_TRIVIAL(debug) << "ssim_ratio = ";
+				BOOST_LOG_TRIVIAL(debug) << "ssim_db = ";
+
+				pos = result.find("average:");
+				psnr_ratio = result.substr(pos + 8, result.npos); // Grab to end of the string
+				pos = psnr_ratio.find(" ");
+				psnr_ratio = psnr_ratio.substr(0, pos);
+				BOOST_LOG_TRIVIAL(debug) << "psnr_ratio = " << psnr_ratio;
+
+				// Pull the encoded file output size.
+
+				ifstream resultfile(OutputFile);
+				resultfile.seekg(0, ios::end);
+				auto end_file = resultfile.tellg();
+				resultfile.close();
+				BOOST_LOG_TRIVIAL(debug) << "Size of the encoded file is: " << end_file << " bytes.";
+			}
+			else {
+				BOOST_LOG_TRIVIAL(debug) << "No file used.  Substituting fake values.";
+				ssim_ratio = "N/A";
+				ssim_db = "N/A";
+				psnr_ratio = "N/A";
+				auto end_file = "0";
+			}
+			
+			// Ouput all the data to the CSV file and log to the screen.
+
+//			csvfile << "Run#,CODEC,Preset,Profile,DestExt,Container,Quality,SSIM(dB),SSIM,PSNR.Total Seconds,File Size,DateTime\n";
+			csvfile << counter << "," << codec_list[loop_enc][0] << "," << codec_list[loop_enc][1]
+				<< "," << codec_list[loop_enc][2] << "," << codec_list[loop_enc][3]
+				<< "," << codec_list[loop_enc][4] << "," << loop_q
+				<< "," << ssim_db << "," << ssim_ratio << "," << psnr_ratio
+				<< "," << elapsed_seconds.count() << "," << end_file << "," << dt_string << "\n";
+			std::cout << counter << "," << codec_list[loop_enc][0] << "," << codec_list[loop_enc][1]
+				<< "," << codec_list[loop_enc][2] << "," << codec_list[loop_enc][3]
+				<< "," << codec_list[loop_enc][4] << "," << loop_q
+				<< "," << ssim_db << "," << ssim_ratio << "," << psnr_ratio
+				<< "," << elapsed_seconds.count() << "," << end_file << "," << dt_string << std::endl;
+		/*	BOOST_LOG_TRIVIAL(debug) << counter << "," << codec_list[loop_enc][0] << "," << codec_list[loop_enc][1]
+				<< "," << codec_list[loop_enc][2] << "," << codec_list[loop_enc][3]
+				<< "," << codec_list[loop_enc][4] << "," << loop_q
+				<< "," << ssim_db << "," << ssim_ratio << "," << psnr_ratio
+				<< "," << elapsed_seconds.count() << "," << end_file << "," << dt_string;
+		*/
 		}
-
 	
 	}
-
+	
 	csvfile.close();
 
 	system("pause");
 }
+
+
+// Valid CODEC Combinations
+/*
+Encoder Tables(best viewed in monpspaced font
+
+Encoder Presets
+
+Preset		x264	x264_10bit	nvenc_h264	mpeg4	mpeg2	x265	x265_10bit	x265_12bit	nvenc_h265	VP8	VP9	theora
+default                              x                                                           x
+placebo	      x          x                                    x         x           x
+veryslow      x          x                                    x         x           x                    x   x
+slower        x          x                                    x         x           x                    x   x
+slow          x          x           x                        x         x           x            x       x   x
+medium        x          x           x                        x         x           x            x       x   x
+fast          x          x           x                        x         x           x            x       x   x
+faster        x          x                                    x         x           x                    x   x
+veryfast      x          x                                    x         x           x                    x   x
+superfast     x          x                                    x         x           x
+ultrafast     x          x                                    x         x           x
+highperformance(hp)                  x                                                           x
+highquality(hq)                      x                                                           x
+
+fastdecode    x          x                                    x         x           x
+
+Profile	x264	x264_10bit	nvenc_h264	mpeg4	mpeg2	x265	x265_10bit	x265_12bit	nvenc_h265	VP8	VP9	theora
+auto	  x          x           x                        x                                  x
+baseline  x                      x
+main      x                      x                        x                                  x
+mainstillpicture                                          x
+main10                                                              x
+main10 - intra                                                      x
+main12                                                                          x
+main12 - intra                                                                  x
+high      x                      x
+high10              x
+
+Level		x264	x264_10bit	nvenc_h264	mpeg4	mpeg2	x265	x265_10bit	x265_12bit	nvenc_h265	VP8	VP9	theora
+auto          x          x           x                                                           x
+1.0           x          x           x                                                           x
+1b            x          x           x
+1.1           x          x           x
+1.2           x          x           x
+1.3           x          x           x
+2.0           x          x           x                                                           x
+2.1           x          x           x                                                           x
+2.2           x          x           x
+3.0           x          x           x                                                           x
+3.1           x          x           x                                                           x
+3.2           x          x           x
+4.0           x          x           x                                                           x
+4.1           x          x           x                                                           x
+4.2           x          x           x
+5.0           x          x           x                                                           x
+5.1           x          x           x                                                           x
+5.2           x          x           x                                                           x
+6.0                                                                                              x
+6.1                                                                                              x
+6.2                                                                                              x
+
+*/
 
 
 // Run program: Ctrl + F5 or Debug > Start Without Debugging menu
